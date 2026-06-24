@@ -1,4 +1,4 @@
-import { initializeApp, applicationDefault } from "firebase-admin/app";
+import { cert, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
 
@@ -11,6 +11,10 @@ export type Identity = {
 
 export type Role = "editor" | "viewer";
 
+export type BotPolicy = "none" | "read" | "write";
+
+export const DEFAULT_BOT_POLICY: BotPolicy = "write";
+
 export type Access = {
   canRead: boolean;
   canWrite: boolean;
@@ -19,6 +23,7 @@ export type Access = {
 export type SocketData = {
   identity: Identity;
   roles: Map<string, Role>;
+  asBot: boolean;
 };
 
 type BoardDoc = {
@@ -29,6 +34,7 @@ type BoardDoc = {
   readPolicy?: "public" | "members";
   writePolicy?: "everyone" | "whitelist" | "owner";
   editors?: string[];
+  botPolicy?: BotPolicy;
 };
 
 type TeamDoc = {
@@ -39,8 +45,15 @@ type TeamDoc = {
 
 export const ANONYMOUS: Identity = { uid: null, email: null };
 
+const serviceAccountPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+if (!serviceAccountPath) {
+  throw new Error(
+    "Missing required environment variable: GOOGLE_APPLICATION_CREDENTIALS",
+  );
+}
+
 const firebaseApp = initializeApp({
-  credential: applicationDefault(),
+  credential: cert(serviceAccountPath),
   projectId: process.env.FIREBASE_PROJECT_ID || "excalidraw-team",
 });
 
@@ -48,8 +61,8 @@ const auth = getAuth(firebaseApp);
 const db = getFirestore(firebaseApp);
 logInfo("firebase.admin.initialized", {
   projectId: process.env.FIREBASE_PROJECT_ID || "excalidraw-team",
-  credentialPath:
-    process.env.GOOGLE_APPLICATION_CREDENTIALS || "<not-configured>",
+  credentialPath: serviceAccountPath,
+  credentialType: "service-account-cert",
 });
 
 export async function resolveIdentity(token?: string): Promise<Identity> {
@@ -147,11 +160,24 @@ export function invalidateAcl(roomId: string): void {
   logInfo("acl.cache_invalidated", { boardId: roomId });
 }
 
-function evaluate(identity: Identity, acl: CachedAcl): Access {
+// A bot impersonates the user who minted its token, so it can never exceed that
+// user's access. `botPolicy` only narrows it further per board.
+function capByBotPolicy(access: Access, botPolicy: BotPolicy): Access {
+  if (botPolicy === "none") {
+    return { canRead: false, canWrite: false };
+  }
+  if (botPolicy === "read") {
+    return { canRead: access.canRead, canWrite: false };
+  }
+  return access;
+}
+
+function evaluate(identity: Identity, acl: CachedAcl, asBot: boolean): Access {
   const { board, team } = acl;
 
   if (!board) {
-    return { canRead: true, canWrite: true };
+    const open: Access = { canRead: true, canWrite: true };
+    return asBot ? capByBotPolicy(open, DEFAULT_BOT_POLICY) : open;
   }
 
   const { uid, email } = identity;
@@ -177,19 +203,24 @@ function evaluate(identity: Identity, acl: CachedAcl): Access {
     (board.writePolicy === "whitelist" && isWhitelisted) ||
     (board.writePolicy !== "owner" && teamEditor);
 
-  return { canRead, canWrite };
+  const access: Access = { canRead, canWrite };
+  return asBot
+    ? capByBotPolicy(access, board.botPolicy ?? DEFAULT_BOT_POLICY)
+    : access;
 }
 
 export async function authorize(
   roomId: string,
   identity: Identity,
+  asBot = false,
 ): Promise<Access> {
   try {
     const acl = await loadAcl(roomId);
-    const access = evaluate(identity, acl);
+    const access = evaluate(identity, acl, asBot);
     logInfo("acl.evaluated", {
       boardId: roomId,
       subjectRef: opaqueRef(identity.uid),
+      asBot,
       canRead: access.canRead,
       canWrite: access.canWrite,
     });

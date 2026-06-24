@@ -76,6 +76,7 @@ server.listen(port, () => {
     corsOrigin: process.env.CORS_ORIGIN || "*",
     credentialPath:
       process.env.GOOGLE_APPLICATION_CREDENTIALS || "<not-configured>",
+    credentialType: "service-account-cert",
   });
 });
 
@@ -118,9 +119,10 @@ try {
       traceId,
     });
 
+    const asBot = socket.handshake.auth?.asBot === true;
     const identityPromise: Promise<Identity> = resolveIdentity(token);
     const roles = new Map<string, Role>();
-    socket.data = { identity: ANONYMOUS, roles };
+    socket.data = { identity: ANONYMOUS, roles, asBot };
 
     socket.on("join-room", async (roomID) => {
       try {
@@ -131,7 +133,7 @@ try {
           traceId,
         });
         const identity = await identityPromise;
-        const { canRead, canWrite } = await authorize(roomID, identity);
+        const { canRead, canWrite } = await authorize(roomID, identity, asBot);
 
         if (!canRead) {
           logWarn("socket.join_room.policy_denied", {
@@ -319,7 +321,11 @@ try {
         let canRead: boolean;
         let canWrite: boolean;
         try {
-          ({ canRead, canWrite } = await authorize(roomId, identity));
+          ({ canRead, canWrite } = await authorize(
+            roomId,
+            identity,
+            remote.data.asBot === true,
+          ));
         } catch (error) {
           logError("acl_change.socket_reevaluation_failed", error, {
             boardId: roomId,
