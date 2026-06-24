@@ -1,9 +1,8 @@
-import debug from "debug";
 import { initializeApp, applicationDefault } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
 
-const aclDebug = debug("acl");
+import { logError, logInfo, logWarn, opaqueRef } from "./logger";
 
 export type Identity = {
   uid: string | null;
@@ -47,16 +46,27 @@ const firebaseApp = initializeApp({
 
 const auth = getAuth(firebaseApp);
 const db = getFirestore(firebaseApp);
+logInfo("firebase.admin.initialized", {
+  projectId: process.env.FIREBASE_PROJECT_ID || "excalidraw-team",
+  credentialPath:
+    process.env.GOOGLE_APPLICATION_CREDENTIALS || "<not-configured>",
+});
 
 export async function resolveIdentity(token?: string): Promise<Identity> {
   if (!token) {
+    logWarn("firebase.socket_identity.missing_token");
     return ANONYMOUS;
   }
   try {
     const decoded = await auth.verifyIdToken(token);
+    logInfo("firebase.socket_identity.verified", {
+      subjectRef: opaqueRef(decoded.uid),
+    });
     return { uid: decoded.uid, email: decoded.email ?? null };
   } catch (error) {
-    aclDebug(`token verification failed, treating as anonymous: ${error}`);
+    logError("firebase.socket_identity.verify_failed", error, {
+      tokenRef: opaqueRef(token),
+    });
     return ANONYMOUS;
   }
 }
@@ -75,33 +85,55 @@ class AclUnavailableError extends Error {}
 async function loadAcl(roomId: string): Promise<CachedAcl> {
   const cached = aclCache.get(roomId);
   if (cached && cached.expiresAt > Date.now()) {
+    logInfo("acl.cache_hit", { boardId: roomId });
     return cached.value;
   }
+  logInfo("acl.cache_miss", { boardId: roomId });
 
   let boardSnap;
   try {
     boardSnap = await db.collection("boards").doc(roomId).get();
   } catch (error) {
-    aclDebug(`failed to read board ${roomId} from Firestore: ${error}`);
-    throw new AclUnavailableError();
+    logError("firestore.board.load_failed", error, { boardId: roomId });
+    throw new AclUnavailableError(`failed to load board ACL for ${roomId}`, {
+      cause: error,
+    });
   }
 
   if (!boardSnap.exists) {
+    logWarn("firestore.board.missing_defaults_to_open", { boardId: roomId });
     const value: CachedAcl = { board: null, team: null };
     aclCache.set(roomId, { value, expiresAt: Date.now() + ACL_CACHE_TTL_MS });
     return value;
   }
 
   const board = boardSnap.data() as BoardDoc;
+  logInfo("firestore.board.loaded", {
+    boardId: roomId,
+    boardType: board.type,
+    readPolicy: board.readPolicy,
+    writePolicy: board.writePolicy,
+    hasTeam: !!board.teamId,
+  });
 
   let team: TeamDoc | null = null;
   if (board.teamId) {
     try {
       const teamSnap = await db.collection("teams").doc(board.teamId).get();
       team = teamSnap.exists ? (teamSnap.data() as TeamDoc) : null;
+      logInfo("firestore.team.loaded", {
+        boardId: roomId,
+        teamRef: opaqueRef(board.teamId),
+        exists: teamSnap.exists,
+      });
     } catch (error) {
-      aclDebug(`failed to read team ${board.teamId} from Firestore: ${error}`);
-      throw new AclUnavailableError();
+      logError("firestore.team.load_failed", error, {
+        boardId: roomId,
+        teamRef: opaqueRef(board.teamId),
+      });
+      throw new AclUnavailableError(`failed to load team ACL for ${roomId}`, {
+        cause: error,
+      });
     }
   }
 
@@ -112,6 +144,7 @@ async function loadAcl(roomId: string): Promise<CachedAcl> {
 
 export function invalidateAcl(roomId: string): void {
   aclCache.delete(roomId);
+  logInfo("acl.cache_invalidated", { boardId: roomId });
 }
 
 function evaluate(identity: Identity, acl: CachedAcl): Access {
@@ -151,6 +184,21 @@ export async function authorize(
   roomId: string,
   identity: Identity,
 ): Promise<Access> {
-  const acl = await loadAcl(roomId);
-  return evaluate(identity, acl);
+  try {
+    const acl = await loadAcl(roomId);
+    const access = evaluate(identity, acl);
+    logInfo("acl.evaluated", {
+      boardId: roomId,
+      subjectRef: opaqueRef(identity.uid),
+      canRead: access.canRead,
+      canWrite: access.canWrite,
+    });
+    return access;
+  } catch (error) {
+    logError("acl.evaluate_failed", error, {
+      boardId: roomId,
+      subjectRef: opaqueRef(identity.uid),
+    });
+    throw error;
+  }
 }
