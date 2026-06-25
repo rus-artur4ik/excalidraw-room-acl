@@ -89,7 +89,7 @@ type CachedAcl = {
   team: TeamDoc | null;
 };
 
-const ACL_CACHE_TTL_MS = 10_000;
+const ACL_CACHE_TTL_MS = 10 * 60_000;
 
 const aclCache = new Map<string, { value: CachedAcl; expiresAt: number }>();
 
