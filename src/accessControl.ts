@@ -15,6 +15,11 @@ export type BotPolicy = "none" | "read" | "write";
 
 export const DEFAULT_BOT_POLICY: BotPolicy = "write";
 
+export type Visibility = "private" | "team" | "link";
+export type TeamRole = "admin" | "editor" | "viewer";
+
+const TEAM_ID = "chats-team";
+
 export type Access = {
   canRead: boolean;
   canWrite: boolean;
@@ -29,12 +34,15 @@ export type SocketData = {
 type BoardDoc = {
   ownerUid?: string;
   ownerEmail?: string;
+  title?: string;
+  visibility?: Visibility;
+  editors?: string[];
+  viewers?: string[];
+  botPolicy?: BotPolicy;
   type?: "personal" | "team";
   teamId?: string;
   readPolicy?: "public" | "members";
   writePolicy?: "everyone" | "whitelist" | "owner";
-  editors?: string[];
-  botPolicy?: BotPolicy;
 };
 
 type TeamDoc = {
@@ -114,7 +122,7 @@ async function loadAcl(roomId: string): Promise<CachedAcl> {
   }
 
   if (!boardSnap.exists) {
-    logWarn("firestore.board.missing_defaults_to_open", { boardId: roomId });
+    logWarn("firestore.board.missing", { boardId: roomId });
     const value: CachedAcl = { board: null, team: null };
     aclCache.set(roomId, { value, expiresAt: Date.now() + ACL_CACHE_TTL_MS });
     return value;
@@ -123,27 +131,21 @@ async function loadAcl(roomId: string): Promise<CachedAcl> {
   const board = boardSnap.data() as BoardDoc;
   logInfo("firestore.board.loaded", {
     boardId: roomId,
-    boardType: board.type,
-    readPolicy: board.readPolicy,
-    writePolicy: board.writePolicy,
-    hasTeam: !!board.teamId,
+    visibility: board.visibility ?? "legacy",
   });
 
   let team: TeamDoc | null = null;
-  if (board.teamId) {
+  const needsTeam = board.visibility === "team" || board.teamId != null;
+  if (needsTeam) {
     try {
-      const teamSnap = await db.collection("teams").doc(board.teamId).get();
+      const teamSnap = await db.collection("teams").doc(TEAM_ID).get();
       team = teamSnap.exists ? (teamSnap.data() as TeamDoc) : null;
       logInfo("firestore.team.loaded", {
         boardId: roomId,
-        teamRef: opaqueRef(board.teamId),
         exists: teamSnap.exists,
       });
     } catch (error) {
-      logError("firestore.team.load_failed", error, {
-        boardId: roomId,
-        teamRef: opaqueRef(board.teamId),
-      });
+      logError("firestore.team.load_failed", error, { boardId: roomId });
       throw new AclUnavailableError(`failed to load team ACL for ${roomId}`, {
         cause: error,
       });
@@ -172,38 +174,83 @@ function capByBotPolicy(access: Access, botPolicy: BotPolicy): Access {
   return access;
 }
 
+function inList(list: string[] | undefined, email: string | null): boolean {
+  return !!email && !!list?.includes(email);
+}
+
+function teamRoleOf(
+  team: TeamDoc | null,
+  email: string | null,
+): TeamRole | null {
+  if (inList(team?.admins, email)) {
+    return "admin";
+  }
+  if (inList(team?.editorEmails, email)) {
+    return "editor";
+  }
+  if (inList(team?.viewerEmails, email)) {
+    return "viewer";
+  }
+  return null;
+}
+
+function legacyAccess(
+  identity: Identity,
+  board: BoardDoc,
+  team: TeamDoc | null,
+): Access {
+  const { uid, email } = identity;
+  const isOwner = !!uid && uid === board.ownerUid;
+  const isWhitelisted = inList(board.editors, email);
+  const role = board.teamId ? teamRoleOf(team, email) : null;
+  const teamEditor = role === "admin" || role === "editor";
+  const teamMember = role !== null;
+  return {
+    canRead:
+      board.readPolicy === "public" || isOwner || isWhitelisted || teamMember,
+    canWrite:
+      board.writePolicy === "everyone" ||
+      isOwner ||
+      (board.writePolicy === "whitelist" && isWhitelisted) ||
+      (board.writePolicy !== "owner" && teamEditor),
+  };
+}
+
 function evaluate(identity: Identity, acl: CachedAcl, asBot: boolean): Access {
   const { board, team } = acl;
 
+  // A missing board doc means a legacy `#room=` share (secured by link secrecy)
+  // for humans, but a bot must never touch a board that has no ACL document.
   if (!board) {
-    const open: Access = { canRead: true, canWrite: true };
-    return asBot ? capByBotPolicy(open, DEFAULT_BOT_POLICY) : open;
+    return asBot
+      ? { canRead: false, canWrite: false }
+      : { canRead: true, canWrite: true };
   }
 
   const { uid, email } = identity;
-
   const isOwner = !!uid && uid === board.ownerUid;
-  const isWhitelisted = !!email && !!board.editors?.includes(email);
 
-  const teamAdmin = !!team && !!email && !!team.admins?.includes(email);
-  const teamEditor =
-    teamAdmin || (!!team && !!email && !!team.editorEmails?.includes(email));
-  const teamMember =
-    teamAdmin ||
-    teamEditor ||
-    (!!team && !!email && !!team.viewerEmails?.includes(email));
+  let access: Access;
+  if (board.visibility === undefined) {
+    access = legacyAccess(identity, board, team);
+  } else {
+    const role = teamRoleOf(team, email);
+    const teamEditor = role === "admin" || role === "editor";
+    const teamMember = role !== null;
+    const invitedEditor = inList(board.editors, email);
+    const invitedViewer = inList(board.viewers, email);
+    access = {
+      canRead:
+        isOwner ||
+        board.visibility === "link" ||
+        (board.visibility === "team" && teamMember) ||
+        invitedEditor ||
+        invitedViewer,
+      canWrite:
+        isOwner || (board.visibility === "team" && teamEditor) || invitedEditor,
+    };
+  }
 
-  const canRead =
-    board.readPolicy === "public" || isOwner || isWhitelisted || teamMember;
-
-  const canWrite =
-    board.writePolicy === "everyone" ||
-    isOwner ||
-    teamAdmin ||
-    (board.writePolicy === "whitelist" && isWhitelisted) ||
-    (board.writePolicy !== "owner" && teamEditor);
-
-  const access: Access = { canRead, canWrite };
   return asBot
     ? capByBotPolicy(access, board.botPolicy ?? DEFAULT_BOT_POLICY)
     : access;
