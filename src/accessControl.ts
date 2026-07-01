@@ -39,6 +39,7 @@ type BoardDoc = {
   editors?: string[];
   viewers?: string[];
   botPolicy?: BotPolicy;
+  archived?: boolean;
   type?: "personal" | "team";
   teamId?: string;
   readPolicy?: "public" | "members";
