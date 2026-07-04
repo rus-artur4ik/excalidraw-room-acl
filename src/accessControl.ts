@@ -4,12 +4,20 @@ import { getFirestore } from "firebase-admin/firestore";
 
 import { logError, logInfo, logWarn, opaqueRef } from "./logger";
 
+export type Role = "editor" | "viewer";
+
+export type BotClaim = {
+  botId: string;
+  boardId: string;
+  role: Role;
+  ownerUid: string;
+};
+
 export type Identity = {
   uid: string | null;
   email: string | null;
+  bot?: BotClaim;
 };
-
-export type Role = "editor" | "viewer";
 
 export type BotPolicy = "none" | "read" | "write";
 
@@ -74,6 +82,24 @@ logInfo("firebase.admin.initialized", {
   credentialType: "service-account-cert",
 });
 
+function extractBotClaim(
+  decoded: Record<string, unknown>,
+): BotClaim | undefined {
+  if (decoded.bot !== true) {
+    return undefined;
+  }
+  const { botId, boardId, role, ownerUid } = decoded;
+  if (
+    typeof botId === "string" &&
+    typeof boardId === "string" &&
+    typeof ownerUid === "string" &&
+    (role === "editor" || role === "viewer")
+  ) {
+    return { botId, boardId, role, ownerUid };
+  }
+  return undefined;
+}
+
 export async function resolveIdentity(token?: string): Promise<Identity> {
   if (!token) {
     logWarn("firebase.socket_identity.missing_token");
@@ -81,10 +107,16 @@ export async function resolveIdentity(token?: string): Promise<Identity> {
   }
   try {
     const decoded = await auth.verifyIdToken(token);
+    const bot = extractBotClaim(decoded as Record<string, unknown>);
     logInfo("firebase.socket_identity.verified", {
       subjectRef: opaqueRef(decoded.uid),
+      bot: bot ? bot.botId : undefined,
     });
-    return { uid: decoded.uid, email: decoded.email ?? null };
+    return {
+      uid: decoded.uid,
+      email: decoded.email ?? null,
+      ...(bot ? { bot } : {}),
+    };
   } catch (error) {
     logError("firebase.socket_identity.verify_failed", error, {
       tokenRef: opaqueRef(token),
@@ -163,8 +195,7 @@ export function invalidateAcl(roomId: string): void {
   logInfo("acl.cache_invalidated", { boardId: roomId });
 }
 
-// A bot impersonates the user who minted its token, so it can never exceed that
-// user's access. `botPolicy` only narrows it further per board.
+// `botPolicy` only narrows a bot's access further per board; it never grants.
 function capByBotPolicy(access: Access, botPolicy: BotPolicy): Access {
   if (botPolicy === "none") {
     return { canRead: false, canWrite: false };
@@ -220,6 +251,19 @@ function legacyAccess(
 function evaluate(identity: Identity, acl: CachedAcl, asBot: boolean): Access {
   const { board, team } = acl;
 
+  // A bot proves its scope with a verified custom claim: access derives from the
+  // claimed role (not the owner's full ACL) and is still capped by botPolicy.
+  if (identity.bot) {
+    if (!board) {
+      return { canRead: false, canWrite: false };
+    }
+    const claimAccess: Access = {
+      canRead: true,
+      canWrite: identity.bot.role === "editor",
+    };
+    return capByBotPolicy(claimAccess, board.botPolicy ?? DEFAULT_BOT_POLICY);
+  }
+
   // A missing board doc means a legacy `#room=` share (secured by link secrecy)
   // for humans, but a bot must never touch a board that has no ACL document.
   if (!board) {
@@ -264,6 +308,14 @@ export async function authorize(
 ): Promise<Access> {
   try {
     const acl = await loadAcl(roomId);
+    if (identity.bot && identity.bot.boardId !== roomId) {
+      logWarn("acl.bot_board_mismatch", {
+        boardId: roomId,
+        claimBoardId: identity.bot.boardId,
+        botId: identity.bot.botId,
+      });
+      return { canRead: false, canWrite: false };
+    }
     const access = evaluate(identity, acl, asBot);
     logInfo("acl.evaluated", {
       boardId: roomId,
