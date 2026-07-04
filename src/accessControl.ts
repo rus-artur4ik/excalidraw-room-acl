@@ -7,6 +7,7 @@ import { logError, logInfo, logWarn, opaqueRef } from "./logger";
 export type Identity = {
   uid: string | null;
   email: string | null;
+  isBot: boolean;
 };
 
 export type Role = "editor" | "viewer";
@@ -31,7 +32,7 @@ export type SocketData = {
   asBot: boolean;
 };
 
-type BoardDoc = {
+export type BoardDoc = {
   ownerUid?: string;
   ownerEmail?: string;
   title?: string;
@@ -45,13 +46,13 @@ type BoardDoc = {
   writePolicy?: "everyone" | "whitelist" | "owner";
 };
 
-type TeamDoc = {
+export type TeamDoc = {
   admins?: string[];
   editorEmails?: string[];
   viewerEmails?: string[];
 };
 
-export const ANONYMOUS: Identity = { uid: null, email: null };
+export const ANONYMOUS: Identity = { uid: null, email: null, isBot: false };
 
 const serviceAccountPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
 if (!serviceAccountPath) {
@@ -79,11 +80,16 @@ export async function resolveIdentity(token?: string): Promise<Identity> {
     return ANONYMOUS;
   }
   try {
-    const decoded = await auth.verifyIdToken(token);
+    const decoded = await auth.verifyIdToken(token, true);
     logInfo("firebase.socket_identity.verified", {
       subjectRef: opaqueRef(decoded.uid),
+      isBot: decoded.bot === true,
     });
-    return { uid: decoded.uid, email: decoded.email ?? null };
+    return {
+      uid: decoded.uid,
+      email: decoded.email ?? null,
+      isBot: decoded.bot === true,
+    };
   } catch (error) {
     logError("firebase.socket_identity.verify_failed", error, {
       tokenRef: opaqueRef(token),
@@ -164,7 +170,7 @@ export function invalidateAcl(roomId: string): void {
 
 // A bot impersonates the user who minted its token, so it can never exceed that
 // user's access. `botPolicy` only narrows it further per board.
-function capByBotPolicy(access: Access, botPolicy: BotPolicy): Access {
+export function capByBotPolicy(access: Access, botPolicy: BotPolicy): Access {
   if (botPolicy === "none") {
     return { canRead: false, canWrite: false };
   }
@@ -216,7 +222,11 @@ function legacyAccess(
   };
 }
 
-function evaluate(identity: Identity, acl: CachedAcl, asBot: boolean): Access {
+export function evaluate(
+  identity: Identity,
+  acl: CachedAcl,
+  asBot: boolean,
+): Access {
   const { board, team } = acl;
 
   // A missing board doc means a legacy `#room=` share (secured by link secrecy)

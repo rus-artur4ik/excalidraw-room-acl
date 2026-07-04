@@ -3,11 +3,11 @@ import http from "http";
 import { Server as SocketIO } from "socket.io";
 
 import {
+  ANONYMOUS,
   authorize,
+  Identity,
   invalidateAcl,
   resolveIdentity,
-  ANONYMOUS,
-  Identity,
   Role,
   SocketData,
 } from "./accessControl";
@@ -119,10 +119,9 @@ try {
       traceId,
     });
 
-    const asBot = socket.handshake.auth?.asBot === true;
     const identityPromise: Promise<Identity> = resolveIdentity(token);
     const roles = new Map<string, Role>();
-    socket.data = { identity: ANONYMOUS, roles, asBot };
+    socket.data = { identity: ANONYMOUS, roles, asBot: false };
 
     socket.on("join-room", async (roomID) => {
       try {
@@ -133,6 +132,7 @@ try {
           traceId,
         });
         const identity = await identityPromise;
+        const asBot = identity.isBot;
         const { canRead, canWrite } = await authorize(roomID, identity, asBot);
 
         if (!canRead) {
@@ -151,6 +151,7 @@ try {
 
         const role: Role = canWrite ? "editor" : "viewer";
         socket.data.identity = identity;
+        socket.data.asBot = asBot;
         roles.set(roomID, role);
 
         await socket.join(roomID);
