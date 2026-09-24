@@ -12,6 +12,13 @@ import {
   SocketData,
 } from "./accessControl";
 import { logError, logInfo, logWarn, opaqueRef } from "./logger";
+import {
+  boardOccupancy,
+  countBroadcast,
+  countJoin,
+  renderMetrics,
+  startMetricsServer,
+} from "./metrics";
 
 type Events = Record<string, (...args: any[]) => void>;
 
@@ -91,6 +98,18 @@ try {
     allowEIO3: true,
   });
 
+  startMetricsServer(Number(process.env.METRICS_PORT ?? 9464), () => {
+    const namespace = io.of("/");
+    return renderMetrics(
+      boardOccupancy(
+        namespace.adapter.rooms,
+        namespace.sockets,
+        (socketId) => namespace.sockets.get(socketId)?.data.asBot === true,
+      ),
+      io.engine.clientsCount,
+    );
+  });
+
   io.engine.on("connection_error", (error) => {
     logError("socket.engine.connection_error", error, {
       errorCode: error.code,
@@ -142,6 +161,7 @@ try {
             subjectRef: opaqueRef(identity.uid),
             traceId,
           });
+          countJoin("denied");
           socket.emit("access-denied", {
             roomId: roomID,
             reason: "acl-policy",
@@ -155,6 +175,7 @@ try {
         roles.set(roomID, role);
 
         await socket.join(roomID);
+        countJoin("ok");
         const sockets = await io.in(roomID).fetchSockets();
         logInfo("socket.join_room.succeeded", {
           socketId: socket.id,
@@ -175,6 +196,7 @@ try {
           sockets.map((roomSocket) => roomSocket.id),
         );
       } catch (error) {
+        countJoin("error");
         logError("socket.join_room.failed", error, {
           socketId: socket.id,
           boardId: roomID,
@@ -200,6 +222,7 @@ try {
           });
           return;
         }
+        countBroadcast("scene");
         socket.broadcast.to(roomID).emit("client-broadcast", encryptedData, iv);
       },
     );
@@ -215,6 +238,7 @@ try {
           });
           return;
         }
+        countBroadcast("cursor");
         socket.volatile.broadcast
           .to(roomID)
           .emit("client-broadcast", encryptedData, iv);
